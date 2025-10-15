@@ -1,0 +1,28 @@
+[package]
+name = "whep_srt"
+description = "WHEP (WebRTC) to SRT"
+version = "0.1.0"
+edition = "2024"
+authors = ["Per Enstedt <per.enstedt@eyevinn.se>"]
+exclude = ["docs/*"]
+
+[[bin]]
+path = "src/main.rs"
+name = "whep-srt"
+
+[dependencies]
+gstreamer = "0.24.2"
+
+#TODO: 
+#   whep signaller feature in gst-plugin-webrtc is not yet present in offical crate. (currently at 0.14.2)
+#   So update this to next offical crate later. Pinning it to git commit SHA for now.
+gst-plugin-webrtc = { git = "https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs", features = ["whep"], rev = "e136005b108ec85bdc8bc533c551f56ef978e950" }
+#gst-plugin-webrtc = { version = "0.15.0", features = ["whep"] }
+
+ctrlc = "3.5.0"
+clap = { version = "4.5.49", features = ["derive"] }
+log = "0.4.28"
+env_logger = "0.11.8"
+
+[dev-dependencies]
+gst-plugin-webrtchttp = "0.14.2"    #whepsrc
