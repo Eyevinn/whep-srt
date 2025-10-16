@@ -75,7 +75,7 @@ fn main() {
     let mixer = "liveadder name=mixer"; //this could be audiomixer also, but liveadder will do fine here
 
     let pipeline_str = format!(
-        "{input} audiotestsrc wave=silence is-live=true ! audio/x-raw,format=F32LE,rate=48000 ! {mixer} ! avenc_aac ! aacparse ! mux. \
+        "{input} audiotestsrc wave=silence is-live=true ! audio/x-raw,format=F32LE,rate=48000,channels=2 ! {mixer} ! avenc_aac ! aacparse ! mux. \
         mpegtsmux name=mux alignment=7 ! queue ! srtsink uri=\"{output_url}\" sync=false wait-for-connection=false latency=100"
     );
 
