@@ -222,7 +222,6 @@ xdot 1729000000-error.dot
 ## Known Issues & Limitations
 
 - **Video handling**: Video tracks are currently discarded (sent to `fakesink`)
-- **Brittle pad matching**: Hardcoded check for `src_5` pad name (see [src/main.rs:157](src/main.rs#L157))
 - **Git dependency**: Uses pinned git commit for `gst-plugin-webrtc` until WHEP feature is available in published crate
 - **Audio-only output**: Only audio is currently muxed to SRT output
 
@@ -245,10 +244,9 @@ Enable debug logging to see if audio pads are being created and linked correctly
 ## Future Improvements
 
 - [ ] Add video support to SRT output
-- [ ] More robust pad detection and handling
-- [ ] Configuration file support
-- [ ] Metrics and monitoring
-- [ ] Reconnection handling
+
+
+
 - [ ] Support for published crates.io versions of gst-plugins-rs
 
 ## License
