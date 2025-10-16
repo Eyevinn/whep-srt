@@ -5,7 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process::exit};
 
 use gst::prelude::*;
-use gstreamer::{self as gst, DebugGraphDetails, ElementFactory, GhostPad, PadDirection};
+use gstreamer::{
+    self as gst, DebugGraphDetails, ElementFactory, GhostPad, PadDirection, PadProbeType,
+};
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -138,10 +140,10 @@ fn main() {
 
         if elem.type_().to_string() == "GstWebRTCBin" {
             elem.connect_pad_added(move |elem, pad| {
-                info!("webrtcbin pad added: {}", pad.name());
+                info!("webrtcbin pad added: '{}'", pad.name());
 
                 /*
-                   Note: When receiving multiple audio tracks (ssrcs), the first track is automatically exposed 'out' of the whepclientsrc bin (src_5)
+                   Note: When receiving multiple audio tracks (ssrcs), the first track is automatically exposed 'out' of the whepclientsrc bin
                    Other tracks are _not_ automatically exposed, so we have to handle that manually. That is why we listen for pad_added on webrtcbin and
                    then ghostpad our way out of the bins.
                 */
@@ -159,8 +161,10 @@ fn main() {
                     .get::<String>("media")
                     .expect("could not get media from caps structure");
 
-                if pad.name() != "src_5" {
-                    //FIXME: this happens to be right, but it's a bit brittle.
+                if !pad.is_linked() {
+                    //this is not automatically linked, we have to handle it. 
+                    info!("pad '{}' is not automatically linked, handling ghostpads. media_type: {media_type}", pad.name());
+
                     let parent = elem.parent().expect("could not get webrtcbin parent");
                     let parent = parent
                         .dynamic_cast_ref::<gst::Bin>()
@@ -201,100 +205,113 @@ fn main() {
 
     input_whep_bin.connect_pad_added(move |elem, pad| {
         info!(
-            "{} '{}' pad added: {}",
+            "pad added on {} named '{}': '{}'",
             elem.type_(),
             elem.name(),
             pad.name()
         );
 
-        if pad.name().to_string().starts_with("audio_") {
-            info!("getting audio track...");
+        let pipeline_clone = pipeline_clone.clone();
+        let mixer_clone = mixer_clone.clone();
 
-            let pipe_bin = pipeline_clone
-                .dynamic_cast_ref::<gst::Bin>()
-                .expect("could not cast pipeline to bin");
+        pad.add_probe(PadProbeType::BUFFER, move |pad, _probe_info| {
+            let caps = pad.current_caps().unwrap();
+            let media_type = caps.structure(0).unwrap().get::<String>("media").unwrap();
 
-            let decodebin = ElementFactory::make("decodebin")
-                .build()
-                .expect("could not create decodebin");
-            pipe_bin
-                .add(&decodebin)
-                .expect("could not add decodebin to pipe_bin");
-            decodebin
-                .sync_state_with_parent()
-                .expect("could not sync_state on decode_bin");
+            info!("getting {media_type} track");
+            match media_type.as_str() {
+                "audio" => {
+                    let pipe_bin = pipeline_clone
+                        .dynamic_cast_ref::<gst::Bin>()
+                        .expect("could not cast pipeline to bin");
 
-            let pipe_bin_clone = pipe_bin.clone();
+                    let decodebin = ElementFactory::make("decodebin")
+                        .build()
+                        .expect("could not create decodebin");
+                    pipe_bin
+                        .add(&decodebin)
+                        .expect("could not add decodebin to pipe_bin");
+                    decodebin
+                        .sync_state_with_parent()
+                        .expect("could not sync_state on decode_bin");
 
-            let mixer_clone = mixer_clone.clone();
-            decodebin.connect_pad_added(move |elem, pad| {
-                info!("pad {} added on decodebin {}", pad.name(), elem.name());
+                    let pipe_bin_clone = pipe_bin.clone();
 
-                let audioconvert = ElementFactory::make("audioconvert")
-                    .build()
-                    .expect("could not create audioconvert");
-                let audioresample = ElementFactory::make("audioresample")
-                    .build()
-                    .expect("could not create audioresample");
-                let caps = ElementFactory::make("capsfilter")
-                    .build()
-                    .expect("could not create capsfiler");
-                caps.set_property_from_str("caps", "audio/x-raw,format=F32LE,rate=48000");
+                    let mixer_clone = mixer_clone.clone();
+                    decodebin.connect_pad_added(move |elem, pad| {
+                        info!("pad '{}' added on decodebin '{}'", pad.name(), elem.name());
 
-                let elements = [&audioconvert, &audioresample, &caps];
+                        let audioconvert = ElementFactory::make("audioconvert")
+                            .build()
+                            .expect("could not create audioconvert");
+                        let audioresample = ElementFactory::make("audioresample")
+                            .build()
+                            .expect("could not create audioresample");
+                        let caps = ElementFactory::make("capsfilter")
+                            .build()
+                            .expect("could not create capsfiler");
+                        caps.set_property_from_str("caps", "audio/x-raw,format=F32LE,rate=48000");
 
-                pipe_bin_clone
-                    .add_many(elements)
-                    .expect("could not add_many");
-                for elem in elements {
-                    elem.sync_state_with_parent()
-                        .expect("could not sync_state_with_parent");
+                        let elements = [&audioconvert, &audioresample, &caps];
+
+                        pipe_bin_clone
+                            .add_many(elements)
+                            .expect("could not add_many");
+                        for elem in elements {
+                            elem.sync_state_with_parent()
+                                .expect("could not sync_state_with_parent");
+                        }
+
+                        gst::Element::link_many(elements).expect("could not link many on elements");
+
+                        //-- setup links from decodebin leg to audiomixer --
+                        let caps_src_pad = caps.static_pad("src").unwrap();
+
+                        let mixer_input_pad = mixer_clone
+                            .request_pad_simple("sink_%u")
+                            .expect("could not get audio mixer input pad");
+
+                        caps_src_pad
+                            .link(&mixer_input_pad)
+                            .expect("could not link input audio to audiomixer");
+
+                        //link decodebin pad to audioconvert
+                        pad.link(&audioconvert.static_pad("sink").unwrap())
+                            .expect("could not link decodebin to audioconvert sink");
+                    });
+
+                    //link from webrtcbin to decodebin
+                    let decodebin_pad = decodebin.iterate_sink_pads().next().unwrap().unwrap();
+
+                    pad.link(&decodebin_pad)
+                        .expect("could not link from webrtcbin audio pad to decodebin");
                 }
+                "video" => {
+                    //TODO: this should be sent to muxer maybe?
 
-                gst::Element::link_many(elements).expect("could not link many on elements");
+                    let fakesink = ElementFactory::make("fakesink")
+                        .build()
+                        .expect("could not create video fakesink");
 
-                //-- setup links from decodebin leg to audiomixer --
-                let caps_src_pad = caps.static_pad("src").unwrap();
+                    pipeline_clone
+                        .add(&fakesink)
+                        .expect("could not add video fakesink to pipeline");
+                    fakesink
+                        .sync_state_with_parent()
+                        .expect("could not sync state on fakesink");
+                    let fakesink_pad = fakesink
+                        .static_pad("sink")
+                        .expect("could not get fakesink pad");
+                    pad.link(&fakesink_pad)
+                        .expect("could not link vidweo sinkpad sink");
+                }
+                _ => {
+                    error!("unhandled media type");
+                }
+            }
 
-                let mixer_input_pad = mixer_clone
-                    .request_pad_simple("sink_%u")
-                    .expect("could not get audio mixer input pad");
-
-                caps_src_pad
-                    .link(&mixer_input_pad)
-                    .expect("could not link input audio to audiomixer");
-
-                //link decodebin pad to audioconvert
-                pad.link(&audioconvert.static_pad("sink").unwrap())
-                    .expect("could not link decodebin to audioconvert sink");
-            });
-
-            //link from webrtcbin to decodebin
-            let decodebin_pad = decodebin.iterate_sink_pads().next().unwrap().unwrap();
-
-            pad.link(&decodebin_pad)
-                .expect("could not link from webrtcbin audio pad to decodebin");
-        } else if pad.name().to_string().starts_with("video_") {
-            info!("got video");
-
-            //TODO: this should be sent to muxer maybe?
-
-            let fakesink = ElementFactory::make("fakesink")
-                .build()
-                .expect("could not create video fakesink");
-
-            pipeline_clone
-                .add(&fakesink)
-                .expect("could not add video fakesink to pipeline");
-            fakesink
-                .sync_state_with_parent()
-                .expect("could not sync state on fakesink");
-            let fakesink_pad = fakesink
-                .static_pad("sink")
-                .expect("could not get fakesink pad");
-            pad.link(&fakesink_pad)
-                .expect("could not link vidweo sinkpad sink");
-        }
+            gstreamer::PadProbeReturn::Remove
+        });
     });
 
     let pipeline_clone = pipeline.clone();
@@ -359,7 +376,7 @@ fn debug_pipeline(pipe: &gst::Bin, str: &str) {
     pipe.debug_to_dot_file(DebugGraphDetails::CAPS_DETAILS, &filename);
 
     info!(
-        "debugging to file: {filename}.dot. Use xdot application to view or convert to svg with 'dot -Tsvg {filename}.dot -o {filename}.svg'"
+        "debugging to file: '{filename}.dot'. Use xdot application to view or convert to svg with 'dot -Tsvg {filename}.dot -o {filename}.svg'"
     );
 
     /*
