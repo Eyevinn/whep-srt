@@ -1,7 +1,7 @@
 [package]
 name = "whep_srt"
 description = "WHEP (WebRTC) to SRT"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 authors = ["Per Enstedt <per.enstedt@eyevinn.se>"]
 exclude = ["docs/*"]
