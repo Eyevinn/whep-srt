@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process::exit};
 
 use gst::prelude::*;
+use gstreamer::glib;
 use gstreamer::{
     self as gst, DebugGraphDetails, ElementFactory, GhostPad, PadDirection, PadProbeType,
 };
@@ -23,6 +24,12 @@ pub struct Args {
     /// Output debug .dot files
     #[clap(long, default_value_t = false)]
     pub dot_debug: bool,
+
+    /// Disable forcing ICE-CONTROLLED role. By default, the client forces ICE-CONTROLLED
+    /// to ensure the server handles ICE keepalive. Disable this for WHEP servers that
+    /// expect the client to be ICE-CONTROLLING.
+    #[clap(long, default_value_t = false)]
+    pub no_force_ice_controlled: bool,
 }
 
 fn main() {
@@ -32,6 +39,7 @@ fn main() {
     let whep_url = args.input_url;
     let output_url = args.output_url;
     let dot_debug = args.dot_debug;
+    let force_ice_controlled = !args.no_force_ice_controlled;
 
     if dot_debug {
         let current_dir = format!(
@@ -139,6 +147,23 @@ fn main() {
         let _ = bin;
 
         if elem.type_().to_string() == "GstWebRTCBin" {
+            // Force ICE-CONTROLLED role to ensure the server is always ICE-CONTROLLING.
+            // When the client wins the ICE tie-breaker and becomes ICE-CONTROLLING, it should
+            // maintain consent freshness. However, without media flow, GStreamer's pipeline
+            // doesn't properly process libnice callbacks, causing timeouts. By forcing the
+            // client to be ICE-CONTROLLED, the server will always maintain the keepalive.
+            if force_ice_controlled {
+                if let Some(ice_agent) = elem.property::<Option<gst::Object>>("ice-agent") {
+                    if let Some(nice_agent) = ice_agent.property::<Option<glib::Object>>("agent") {
+                        nice_agent.set_property("controlling-mode", false);
+                        info!("Set NiceAgent controlling-mode to FALSE (ICE-CONTROLLED)");
+                    } else {
+                        log::warn!("Could not get NiceAgent from ice-agent");
+                    }
+                } else {
+                    log::warn!("Could not get ice-agent from webrtcbin");
+                }
+            }
             elem.connect_pad_added(move |elem, pad| {
                 info!("webrtcbin pad added: '{}'", pad.name());
 
@@ -150,7 +175,7 @@ fn main() {
 
                 let caps = pad
                     .current_caps()
-                    .expect(&format!("could not get current_caps on pad {}", pad.name()));
+                    .unwrap_or_else(|| panic!("could not get current_caps on pad {}", pad.name()));
                 let s = caps
                     .structure(0)
                     .expect("could not get structure 0 on caps");
@@ -303,7 +328,7 @@ fn main() {
                         .static_pad("sink")
                         .expect("could not get fakesink pad");
                     pad.link(&fakesink_pad)
-                        .expect("could not link vidweo sinkpad sink");
+                        .expect("could not link video sinkpad sink");
                 }
                 _ => {
                     error!("unhandled media type");
@@ -373,7 +398,7 @@ fn debug_pipeline(pipe: &gst::Bin, str: &str) {
     let epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 
     let filename = format!("{:?}-{}", epoch.as_secs(), str);
-    pipe.debug_to_dot_file(DebugGraphDetails::CAPS_DETAILS, &filename);
+    pipe.debug_to_dot_file(DebugGraphDetails::ALL, &filename);
 
     info!(
         "debugging to file: '{filename}.dot'. Use xdot application to view or convert to svg with 'dot -Tsvg {filename}.dot -o {filename}.svg'"
