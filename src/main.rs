@@ -5,7 +5,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process::exit};
 
 use gst::prelude::*;
-use gstreamer::glib;
 use gstreamer::{
     self as gst, DebugGraphDetails, ElementFactory, GhostPad, PadDirection, PadProbeType,
 };
@@ -24,12 +23,6 @@ pub struct Args {
     /// Output debug .dot files
     #[clap(long, default_value_t = false)]
     pub dot_debug: bool,
-
-    /// Disable forcing ICE-CONTROLLED role. By default, the client forces ICE-CONTROLLED
-    /// to ensure the server handles ICE keepalive. Disable this for WHEP servers that
-    /// expect the client to be ICE-CONTROLLING.
-    #[clap(long, default_value_t = false)]
-    pub no_force_ice_controlled: bool,
 }
 
 fn main() {
@@ -39,7 +32,6 @@ fn main() {
     let whep_url = args.input_url;
     let output_url = args.output_url;
     let dot_debug = args.dot_debug;
-    let force_ice_controlled = !args.no_force_ice_controlled;
 
     if dot_debug {
         let current_dir = format!(
@@ -68,16 +60,16 @@ fn main() {
        In this project we use the new whepclientsrc. Below is some dev code if you want to try out the old whepsrc implementation for some reason.
     */
 
-    let whepsrc = false; //only for dev testing
-    let input = if whepsrc {
-        //gstwebrtchttp::plugin_register_static().expect("Could not register gstwebrtchttp plugins"); //whepsrc
+    let use_whepsrc = false;
+    let input = if use_whepsrc {
+        //gstwebrtchttp::plugin_register_static().expect("Could not register gstwebrtchttp plugins");
 
         let audio_caps = "audio_caps=\"application/x-rtp, media=(string)audio, encoding-name=(string)opus, payload=(int)96, encoding-params=(string)2, clock-rate=(int)48000\"";
         format!(
             "whepsrc name=input use-link-headers=false whep-endpoint=\"{whep_url}\" {audio_caps} video-caps=\"\""
         )
     } else {
-        gstrswebrtc::plugin_register_static().expect("Could not register gstrswebrtc plugins"); //whepclientsrc in crate feature whep
+        gstrswebrtc::plugin_register_static().expect("Could not register gstrswebrtc plugins");
 
         format!("whepclientsrc name=input signaller::whep-endpoint=\"{whep_url}\"")
     };
@@ -135,35 +127,15 @@ fn main() {
 
     let bus = pipeline.bus().unwrap();
 
-    pipeline
-        .set_state(gst::State::Playing)
-        .expect("Unable to set the pipeline to the `Playing` state");
-
     let pipeline_clone = pipeline.clone();
 
     pipeline.connect_deep_element_added(move |pipe, bin, elem| {
-        //info!("deep element added: {:?} {:?} {:?}", pipe, bin, elem);
+        let elem_type = elem.type_().to_string();
         let _ = pipe;
         let _ = bin;
 
-        if elem.type_().to_string() == "GstWebRTCBin" {
-            // Force ICE-CONTROLLED role to ensure the server is always ICE-CONTROLLING.
-            // When the client wins the ICE tie-breaker and becomes ICE-CONTROLLING, it should
-            // maintain consent freshness. However, without media flow, GStreamer's pipeline
-            // doesn't properly process libnice callbacks, causing timeouts. By forcing the
-            // client to be ICE-CONTROLLED, the server will always maintain the keepalive.
-            if force_ice_controlled {
-                if let Some(ice_agent) = elem.property::<Option<gst::Object>>("ice-agent") {
-                    if let Some(nice_agent) = ice_agent.property::<Option<glib::Object>>("agent") {
-                        nice_agent.set_property("controlling-mode", false);
-                        info!("Set NiceAgent controlling-mode to FALSE (ICE-CONTROLLED)");
-                    } else {
-                        log::warn!("Could not get NiceAgent from ice-agent");
-                    }
-                } else {
-                    log::warn!("Could not get ice-agent from webrtcbin");
-                }
-            }
+        if elem_type == "GstWebRTCBin" {
+            
             elem.connect_pad_added(move |elem, pad| {
                 info!("webrtcbin pad added: '{}'", pad.name());
 
@@ -338,6 +310,11 @@ fn main() {
             gstreamer::PadProbeReturn::Remove
         });
     });
+
+    // Start pipeline - ICE role is configured via webrtcbin-ready signal
+    pipeline
+        .set_state(gst::State::Playing)
+        .expect("Unable to set the pipeline to the `Playing` state");
 
     let pipeline_clone = pipeline.clone();
 
