@@ -48,17 +48,18 @@ COPY . .
 # Build our application
 RUN cargo build --release
 
-FROM lukemathwalker/cargo-chef:latest-rust-slim-bookworm AS runtime
+FROM debian:trixie-slim AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt update
-RUN apt-get install -y libgstreamer1.0-0 \
+RUN apt-get update && apt-get install -y \
+    libgstreamer1.0-0 \
     gstreamer1.0-plugins-base \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad \
     gstreamer1.0-plugins-ugly \
     gstreamer1.0-libav \
     gstreamer1.0-tools \
-    gstreamer1.0-nice
+    gstreamer1.0-nice \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=builder /app/target/release/whep-srt ./whep-srt
