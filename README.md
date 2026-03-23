@@ -44,7 +44,7 @@ This tool consumes WebRTC media from a WHEP endpoint and re-streams it as SRT, e
 This project requires GStreamer Rust plugins from [gst-plugins-rs](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs):
 - `gst-plugin-webrtc` (provides `whepclientsrc` with WHEP feature)
 
-**Note**: The `Cargo.toml` currently uses a git dependency pinned to a specific commit SHA (`e136005b108ec85bdc8bc533c551f56ef978e950`) because the WHEP signaller feature is not yet available in the official crate release. This will be updated to use the published crate once the feature is available in the next official release.
+The WHEP signaller feature is available from version `0.15.0` of the published crate.
 
 ## Building
 
@@ -81,11 +81,13 @@ docker run -it whep-srt -i <WHEP_ENDPOINT_URL> -o <SRT_OUTPUT_URL>
 
 ### Command Line Options
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-i, --input-url` | WHEP source URL (required) | - |
-| `-o, --output-url` | SRT output stream URL | `srt://0.0.0.0:1234?mode=listener` |
-| `--dot-debug` | Output debug .dot files of the pipeline | `false` |
+| Option | Environment Variable | Description | Default |
+|--------|---------------------|-------------|---------|
+| `-i, --input-url` | | WHEP source URL (required) | - |
+| `-o, --output-url` | | SRT output stream URL | `srt://0.0.0.0:1234?mode=listener` |
+| `--auth-token` | `WHEP_SRT_AUTH_TOKEN` | Authorization token for WHEP endpoint | - |
+| `--latency` | `WHEP_SRT_JITTERBUFFER_LATENCY` | Jitterbuffer latency in ms (sets rtpbin latency and liveadder min-upstream-latency) | `200` |
+| `--dot-debug` | | Output debug .dot files of the pipeline | `false` |
 
 ### Examples
 
@@ -156,12 +158,12 @@ The SRT output URL supports standard SRT URI parameters:
 
 ### WHEP Source Selection
 
-The application supports two WHEP source implementations (configurable in [src/main.rs:56](src/main.rs#L56)):
+The application supports two WHEP source implementations (configurable in [src/main.rs:72](src/main.rs#L72)):
 
 - **whepclientsrc** (currently enabled) - From `gst-plugin-webrtc` - Newer implementation using signaller interface (will eventually replace whepsrc)
 - **whepsrc** - From `gst-plugin-webrtchttp` - Original WebRTC implementation based on webrtcbin
 
-Toggle between them by changing the `whepsrc` boolean variable in the code. Note: `whepclientsrc` requires the plugin to be registered via `gstrswebrtc::plugin_register_static()` as shown in [src/main.rs:65](src/main.rs#L65).
+Toggle between them by changing the `whepsrc` boolean variable in the code. Note: `whepclientsrc` requires the plugin to be registered via `gstrswebrtc::plugin_register_static()` as shown in [src/main.rs:81](src/main.rs#L81).
 
 ### Supported Codecs
 
@@ -213,16 +215,15 @@ xdot 1729000000-error.dot
 ### Code Structure
 
 - [src/main.rs](src/main.rs) - Main application logic
-  - Command-line argument parsing ([Args struct](src/main.rs#L10-L24))
+  - Command-line argument parsing ([Args struct](src/main.rs#L12-L34))
   - Pipeline construction and management
   - Dynamic pad handling for audio/video tracks
   - Event loop and error handling
-  - Debug pipeline visualization ([debug_pipeline function](src/main.rs#L351-L368))
+  - Debug pipeline visualization ([debug_pipeline function](src/main.rs#L393-L412))
 
 ## Known Issues & Limitations
 
 - **Video handling**: Video tracks are currently discarded (sent to `fakesink`)
-- **Git dependency**: Uses pinned git commit for `gst-plugin-webrtc` until WHEP feature is available in published crate
 - **Audio-only output**: Only audio is currently muxed to SRT output
 
 ## Troubleshooting
@@ -244,10 +245,6 @@ Enable debug logging to see if audio pads are being created and linked correctly
 ## Future Improvements
 
 - [ ] Add video support to SRT output
-
-
-
-- [ ] Support for published crates.io versions of gst-plugins-rs
 
 ## License
 
