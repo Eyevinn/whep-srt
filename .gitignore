@@ -3,3 +3,5 @@
 .DS_Store
 docs/.DS_Store
 /run.sh
+*.dot
+*.svg

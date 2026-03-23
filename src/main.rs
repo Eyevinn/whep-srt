@@ -23,6 +23,14 @@ pub struct Args {
     /// Output debug .dot files
     #[clap(long, default_value_t = false)]
     pub dot_debug: bool,
+
+    /// Jitterbuffer latency in milliseconds (sets rtpbin latency and liveadder min-upstream-latency)
+    #[clap(long, env = "WHEP_SRT_JITTERBUFFER_LATENCY", default_value_t = 200)]
+    pub latency: u64,
+
+    /// Authorization token for WHEP endpoint
+    #[clap(long, env = "WHEP_SRT_AUTH_TOKEN")]
+    pub auth_token: Option<String>,
 }
 
 fn main() {
@@ -32,6 +40,7 @@ fn main() {
     let whep_url = args.input_url;
     let output_url = args.output_url;
     let dot_debug = args.dot_debug;
+    let latency = args.latency;
 
     if dot_debug {
         let current_dir = format!(
@@ -71,7 +80,11 @@ fn main() {
     } else {
         gstrswebrtc::plugin_register_static().expect("Could not register gstrswebrtc plugins");
 
-        format!("whepclientsrc name=input signaller::whep-endpoint=\"{whep_url}\"")
+        let mut src = format!("whepclientsrc name=input signaller::whep-endpoint=\"{whep_url}\"");
+        if let Some(ref token) = args.auth_token {
+            src.push_str(&format!(" signaller::auth-token=\"{token}\""));
+        }
+        src
     };
 
     let mixer = "liveadder name=mixer"; //this could be audiomixer also, but liveadder will do fine here
@@ -107,6 +120,7 @@ fn main() {
     let mixer = pipeline
         .by_name("mixer")
         .expect("could not find mixer element");
+    mixer.set_property_from_str("min-upstream-latency", &format!("{latency}000000"));
     let mixer_clone = mixer.clone();
 
     let input_whep_bin = pipeline
@@ -133,6 +147,11 @@ fn main() {
         let elem_type = elem.type_().to_string();
         let _ = pipe;
         let _ = bin;
+
+        if elem_type == "GstRtpBin" {
+            info!("setting rtpbin latency to {latency} ms");
+            elem.set_property_from_str("latency", &latency.to_string());
+        }
 
         if elem_type == "GstWebRTCBin" {
             
