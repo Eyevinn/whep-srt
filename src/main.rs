@@ -155,7 +155,6 @@ fn main() {
         }
 
         if elem_type == "GstWebRTCBin" {
-            
             elem.connect_pad_added(move |elem, pad| {
                 info!("webrtcbin pad added: '{}'", pad.name());
 
