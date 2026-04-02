@@ -149,8 +149,9 @@ fn main() {
         let _ = bin;
 
         if elem_type == "GstRtpBin" {
-            info!("setting rtpbin latency to {latency} ms");
+            info!("setting rtpbin latency to {latency} ms, drop-on-latency=true");
             elem.set_property_from_str("latency", &latency.to_string());
+            elem.set_property_from_str("drop-on-latency", "true"); //workaround for large packet_sizing bug in rtpjitterbuffer after long mute + packet loss within first second => stalled audio
         }
 
         if elem_type == "GstWebRTCBin" {
