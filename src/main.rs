@@ -25,7 +25,7 @@ pub struct Args {
     pub output_url: String,
 
     /// Output debug .dot files
-    #[clap(long, default_value_t = false)]
+    #[clap(long)]
     pub dot_debug: bool,
 
     /// Jitterbuffer latency in milliseconds (sets rtpbin latency and liveadder min-upstream-latency)
@@ -37,7 +37,7 @@ pub struct Args {
     pub auth_token: Option<String>,
 
     /// Bridge video tracks from WHEP to SRT output (re-encodes to H.264 in MPEG-TS)
-    #[clap(long, default_value_t = false)]
+    #[clap(long)]
     pub bridge_video: bool,
 }
 
@@ -68,6 +68,14 @@ fn main() {
     gst::init().expect("Could not initiate GStreamer");
 
     info!("SRT output at {output_url}");
+    if bridge_video {
+        // h264parse is intentionally omitted from the video encode chain: on the GStreamer build
+        // used here (debian trixie / gst-plugins-bad 1.24+) h264parse moves SPS/PPS out-of-band
+        // into caps codec_data regardless of config-interval, making the stream undecodable.
+        // x264enc already emits inline AnnexB SPS+PPS before every IDR; a byte-stream capsfilter
+        // is used instead to enforce correct mpegtsmux negotiation.
+        info!("video bridging enabled: incoming video → H.264 (x264enc, tune=zerolatency)");
+    }
     info!("---");
 
     /*  NOTE:
@@ -244,8 +252,18 @@ fn main() {
         let video_bridged = video_bridged.clone();
 
         pad.add_probe(PadProbeType::BUFFER, move |pad, _probe_info| {
-            let caps = pad.current_caps().unwrap();
-            let media_type = caps.structure(0).unwrap().get::<String>("media").unwrap();
+            let Some(caps) = pad.current_caps() else {
+                error!("buffer probe: could not get caps from pad '{}'", pad.name());
+                return gstreamer::PadProbeReturn::Remove;
+            };
+            let Some(structure) = caps.structure(0) else {
+                error!("buffer probe: caps on pad '{}' have no structure", pad.name());
+                return gstreamer::PadProbeReturn::Remove;
+            };
+            let Ok(media_type) = structure.get::<String>("media") else {
+                error!("buffer probe: caps on pad '{}' have no media field", pad.name());
+                return gstreamer::PadProbeReturn::Remove;
+            };
 
             info!("getting {media_type} track");
             match media_type.as_str() {
@@ -309,9 +327,11 @@ fn main() {
                             .expect("could not link decodebin to audioconvert sink");
                     });
 
-                    //link from webrtcbin to decodebin
-                    let decodebin_pad = decodebin.iterate_sink_pads().next().unwrap().unwrap();
-
+                    let decodebin_pad = decodebin
+                        .sink_pads()
+                        .into_iter()
+                        .next()
+                        .expect("audio decodebin has no sink pad");
                     pad.link(&decodebin_pad)
                         .expect("could not link from webrtcbin audio pad to decodebin");
                 }
@@ -319,11 +339,15 @@ fn main() {
                     // Bridge the first video track to mpegtsmux; send additional tracks to fakesink.
                     // video_bridged.swap returns the *previous* value, so the first caller gets false
                     // and proceeds to bridge; all subsequent callers get true and use fakesink.
-                    if !bridge_video || video_bridged.swap(true, Ordering::SeqCst) {
+                    // AcqRel is sufficient: we only need to synchronise this flag, not other memory.
+                    if !bridge_video || video_bridged.swap(true, Ordering::AcqRel) {
+                        let pipe_bin = pipeline_clone
+                            .dynamic_cast_ref::<gst::Bin>()
+                            .expect("could not cast pipeline to bin");
                         let fakesink = ElementFactory::make("fakesink")
                             .build()
                             .expect("could not create video fakesink");
-                        pipeline_clone
+                        pipe_bin
                             .add(&fakesink)
                             .expect("could not add video fakesink to pipeline");
                         fakesink
@@ -356,7 +380,7 @@ fn main() {
                         decodebin.connect_pad_added(move |_elem, src_pad| {
                             info!("video decodebin src pad added: '{}'", src_pad.name());
 
-                            // Decode → convert → encode H.264 → parse → byte-stream caps → queue → mux.
+                            // Decode → convert → encode H.264 → byte-stream caps → queue → mux.
                             // tune=zerolatency: encode each frame immediately without lookahead,
                             // keeping video latency in line with the audio path.
                             let videoconvert = ElementFactory::make("videoconvert")
@@ -369,10 +393,15 @@ fn main() {
                             x264enc.set_property_from_str("speed-preset", "ultrafast");
                             // Shorter keyframe interval means faster initial sync for new viewers.
                             x264enc.set_property_from_str("key-int-max", "30");
-                            // x264enc already emits SPS+PPS before every IDR in byte-stream format.
-                            // h264parse on this GStreamer build moves them out-of-band into caps
-                            // codec_data regardless of config-interval, so we skip it entirely and
-                            // let x264enc's native AnnexB output go straight to the mux.
+                            // h264parse with byte-stream output drops codec_data from its src caps
+                            // (byte-stream is self-contained — no out-of-band data needed), so
+                            // mpegtsmux has nothing to put in the HDMV PMT descriptor. FFmpeg then
+                            // reads SPS/PPS inline from the elementary stream, which h264parse
+                            // guarantees are present before every IDR via config-interval=-1.
+                            let h264parse = ElementFactory::make("h264parse")
+                                .build()
+                                .expect("could not create h264parse");
+                            h264parse.set_property_from_str("config-interval", "-1");
                             let stream_caps = ElementFactory::make("capsfilter")
                                 .build()
                                 .expect("could not create h264 stream capsfilter");
@@ -384,7 +413,7 @@ fn main() {
                                 .build()
                                 .expect("could not create video queue");
 
-                            let elements = [&videoconvert, &x264enc, &stream_caps, &queue];
+                            let elements = [&videoconvert, &x264enc, &h264parse, &stream_caps, &queue];
                             pipe_bin_clone
                                 .add_many(elements)
                                 .expect("could not add video encode elements to pipeline");
@@ -426,10 +455,10 @@ fn main() {
                         });
 
                         let decodebin_sink = decodebin
-                            .iterate_sink_pads()
+                            .sink_pads()
+                            .into_iter()
                             .next()
-                            .unwrap()
-                            .expect("could not get video decodebin sink pad");
+                            .expect("video decodebin has no sink pad");
                         pad.link(&decodebin_sink)
                             .expect("could not link video whep pad to video decodebin");
                     }

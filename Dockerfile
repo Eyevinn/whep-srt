@@ -48,7 +48,7 @@ COPY . .
 # Build our application
 RUN cargo build --release
 
-FROM debian:trixie-slim AS runtime
+FROM debian:bookworm-slim AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
     libgstreamer1.0-0 \
