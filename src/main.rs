@@ -69,12 +69,7 @@ fn main() {
 
     info!("SRT output at {output_url}");
     if bridge_video {
-        // h264parse is intentionally omitted from the video encode chain: on the GStreamer build
-        // used here (debian trixie / gst-plugins-bad 1.24+) h264parse moves SPS/PPS out-of-band
-        // into caps codec_data regardless of config-interval, making the stream undecodable.
-        // x264enc already emits inline AnnexB SPS+PPS before every IDR; a byte-stream capsfilter
-        // is used instead to enforce correct mpegtsmux negotiation.
-        info!("video bridging enabled: incoming video → H.264 (x264enc, tune=zerolatency)");
+        info!("video bridging enabled: incoming video → x264 (preset=fast, tune=zerolatency)");
     }
     info!("---");
 
@@ -106,6 +101,14 @@ fn main() {
 
     let mixer = "liveadder name=mixer"; //this could be audiomixer also, but liveadder will do fine here
 
+    // Note on the initial PMT: with --bridge-video, the real-video chain attaches to
+    // mpegtsmux dynamically when WHEP delivers a video pad (some seconds after startup).
+    // Until then the streamheader PAT/PMT advertises audio only.  SRT relays that latch
+    // onto the initial streamheaders therefore expose audio only to subscribers.  We
+    // previously tried a videotestsrc-fed input-selector to inject video into the initial
+    // PMT, but mpegtsmux's aggregator stalls on the running-time discontinuity that comes
+    // with the active-pad switch — better to keep the pipeline simple and document the
+    // limitation than to ship a stream that hangs.
     let pipeline_str = format!(
         "{input} audiotestsrc wave=silence is-live=true ! audio/x-raw,format=F32LE,rate=48000,channels=2 ! {mixer} ! avenc_aac ! aacparse ! mux. \
         mpegtsmux name=mux alignment=7 ! queue ! srtsink uri=\"{output_url}\" sync=false wait-for-connection=false latency=100"
@@ -356,7 +359,10 @@ fn main() {
                         pad.link(&fakesink.static_pad("sink").unwrap())
                             .expect("could not link video pad to fakesink");
                     } else {
-                        info!("bridging video track to SRT output");
+                        let encoding_name = structure
+                            .get::<String>("encoding-name")
+                            .unwrap_or_default();
+                        info!("bridging {encoding_name} video track to SRT output (transcode to H.264)");
 
                         let pipe_bin = pipeline_clone
                             .dynamic_cast_ref::<gst::Bin>()
@@ -381,8 +387,15 @@ fn main() {
                             info!("video decodebin src pad added: '{}'", src_pad.name());
 
                             // Decode → convert → encode H.264 → byte-stream caps → queue → mux.
-                            // tune=zerolatency: encode each frame immediately without lookahead,
-                            // keeping video latency in line with the audio path.
+                            //   - tune=zerolatency: no B-frames, no lookahead — required for live.
+                            //   - speed-preset=fast: noticeably better quality than veryfast at
+                            //     the same bitrate; still real-time on commodity hardware for
+                            //     720p/30fps.  If CPU is a concern, drop to 'faster' or 'veryfast'.
+                            //   - bitrate=8000 kbps: comfortably high for talking-head / screen
+                            //     content at 720p-1080p; reduce for lower-resolution sources.
+                            //   - key-int-max=60: 2 s keyframe interval — better compression
+                            //     efficiency.  Drop to 30 if subscribers need faster initial sync.
+                            //   - bframes=0 and CABAC are already correct via tune=zerolatency.
                             let videoconvert = ElementFactory::make("videoconvert")
                                 .build()
                                 .expect("could not create videoconvert");
@@ -390,14 +403,9 @@ fn main() {
                                 .build()
                                 .expect("could not create x264enc — ensure gstreamer1.0-plugins-ugly is installed");
                             x264enc.set_property_from_str("tune", "zerolatency");
-                            x264enc.set_property_from_str("speed-preset", "ultrafast");
-                            // Shorter keyframe interval means faster initial sync for new viewers.
-                            x264enc.set_property_from_str("key-int-max", "30");
-                            // h264parse with byte-stream output drops codec_data from its src caps
-                            // (byte-stream is self-contained — no out-of-band data needed), so
-                            // mpegtsmux has nothing to put in the HDMV PMT descriptor. FFmpeg then
-                            // reads SPS/PPS inline from the elementary stream, which h264parse
-                            // guarantees are present before every IDR via config-interval=-1.
+                            x264enc.set_property_from_str("speed-preset", "fast");
+                            x264enc.set_property_from_str("bitrate", "8000");
+                            x264enc.set_property_from_str("key-int-max", "60");
                             let h264parse = ElementFactory::make("h264parse")
                                 .build()
                                 .expect("could not create h264parse");
@@ -427,8 +435,6 @@ fn main() {
                             let mux = pipeline_for_mux
                                 .by_name("mux")
                                 .expect("could not find mpegtsmux");
-                            // Find the sink pad template that accepts video/x-h264 rather than
-                            // hardcoding a template name that varies across GStreamer builds.
                             let h264_caps = gst::Caps::builder("video/x-h264").build();
                             let mux_video_pad = mux
                                 .pad_template_list()
