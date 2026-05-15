@@ -39,6 +39,22 @@ pub struct Args {
     /// Bridge video tracks from WHEP to SRT output (re-encodes to H.264 in MPEG-TS)
     #[clap(long)]
     pub bridge_video: bool,
+
+    /// x264enc bitrate in kbps (used when --bridge-video is set)
+    #[clap(long, env = "WHEP_SRT_VIDEO_BITRATE", default_value_t = 8000)]
+    pub video_bitrate: u32,
+
+    /// x264enc speed-preset: ultrafast, superfast, veryfast, faster, fast, medium, slow,
+    /// slower, veryslow, placebo.  Slower presets give better quality at the same bitrate
+    /// but use more CPU; veryfast/faster are usually safe for live, fast and above need
+    /// strong hardware for 720p+/30fps.
+    #[clap(long, env = "WHEP_SRT_VIDEO_PRESET", default_value_t = String::from("fast"))]
+    pub video_preset: String,
+
+    /// x264enc key-int-max: max distance between keyframes (in frames).  Smaller values
+    /// give faster initial sync for new viewers but worse compression efficiency.
+    #[clap(long, env = "WHEP_SRT_VIDEO_KEY_INT", default_value_t = 60)]
+    pub video_key_int: u32,
 }
 
 fn main() {
@@ -50,6 +66,9 @@ fn main() {
     let dot_debug = args.dot_debug;
     let latency = args.latency;
     let bridge_video = args.bridge_video;
+    let video_bitrate = args.video_bitrate;
+    let video_preset = args.video_preset;
+    let video_key_int = args.video_key_int;
 
     if dot_debug {
         let current_dir = format!(
@@ -69,7 +88,10 @@ fn main() {
 
     info!("SRT output at {output_url}");
     if bridge_video {
-        info!("video bridging enabled: incoming video → x264 (preset=fast, tune=zerolatency)");
+        info!(
+            "video bridging enabled: x264 preset={video_preset}, bitrate={video_bitrate} kbps, \
+             key-int-max={video_key_int}, tune=zerolatency"
+        );
     }
     info!("---");
 
@@ -242,6 +264,7 @@ fn main() {
         }
     });
 
+    let video_preset_for_probe = video_preset.clone();
     input_whep_bin.connect_pad_added(move |elem, pad| {
         info!(
             "pad added on {} named '{}': '{}'",
@@ -253,6 +276,7 @@ fn main() {
         let pipeline_clone = pipeline_clone.clone();
         let mixer_clone = mixer_clone.clone();
         let video_bridged = video_bridged.clone();
+        let video_preset = video_preset_for_probe.clone();
 
         pad.add_probe(PadProbeType::BUFFER, move |pad, _probe_info| {
             let Some(caps) = pad.current_caps() else {
@@ -382,20 +406,16 @@ fn main() {
                         // pipe_bin borrow must end before pipeline_clone.clone() — NLL handles this.
                         let pipe_bin_clone = pipe_bin.clone();
                         let pipeline_for_mux = pipeline_clone.clone();
+                        let video_preset = video_preset.clone();
 
                         decodebin.connect_pad_added(move |_elem, src_pad| {
                             info!("video decodebin src pad added: '{}'", src_pad.name());
 
                             // Decode → convert → encode H.264 → byte-stream caps → queue → mux.
-                            //   - tune=zerolatency: no B-frames, no lookahead — required for live.
-                            //   - speed-preset=fast: noticeably better quality than veryfast at
-                            //     the same bitrate; still real-time on commodity hardware for
-                            //     720p/30fps.  If CPU is a concern, drop to 'faster' or 'veryfast'.
-                            //   - bitrate=8000 kbps: comfortably high for talking-head / screen
-                            //     content at 720p-1080p; reduce for lower-resolution sources.
-                            //   - key-int-max=60: 2 s keyframe interval — better compression
-                            //     efficiency.  Drop to 30 if subscribers need faster initial sync.
-                            //   - bframes=0 and CABAC are already correct via tune=zerolatency.
+                            // tune=zerolatency: no B-frames / no lookahead — required for live.
+                            // bframes=0 and CABAC are already correct via tune=zerolatency.
+                            // speed-preset / bitrate / key-int-max are tunable via CLI flags;
+                            // see Args for env var names and defaults.
                             let videoconvert = ElementFactory::make("videoconvert")
                                 .build()
                                 .expect("could not create videoconvert");
@@ -403,9 +423,9 @@ fn main() {
                                 .build()
                                 .expect("could not create x264enc — ensure gstreamer1.0-plugins-ugly is installed");
                             x264enc.set_property_from_str("tune", "zerolatency");
-                            x264enc.set_property_from_str("speed-preset", "fast");
-                            x264enc.set_property_from_str("bitrate", "8000");
-                            x264enc.set_property_from_str("key-int-max", "60");
+                            x264enc.set_property_from_str("speed-preset", &video_preset);
+                            x264enc.set_property_from_str("bitrate", &video_bitrate.to_string());
+                            x264enc.set_property_from_str("key-int-max", &video_key_int.to_string());
                             let h264parse = ElementFactory::make("h264parse")
                                 .build()
                                 .expect("could not create h264parse");

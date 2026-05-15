@@ -89,6 +89,9 @@ docker run -it whep-srt -i <WHEP_ENDPOINT_URL> -o <SRT_OUTPUT_URL>
 | `--auth-token` | `WHEP_SRT_AUTH_TOKEN` | Authorization token for WHEP endpoint | - |
 | `--latency` | `WHEP_SRT_JITTERBUFFER_LATENCY` | Jitterbuffer latency in ms (sets rtpbin latency and liveadder min-upstream-latency) | `200` |
 | `--bridge-video` | | Transcode incoming video tracks to H.264 and include them in the SRT output | `false` |
+| `--video-bitrate` | `WHEP_SRT_VIDEO_BITRATE` | x264enc target bitrate in kbps (only used with `--bridge-video`) | `8000` |
+| `--video-preset` | `WHEP_SRT_VIDEO_PRESET` | x264enc speed-preset: `ultrafast`, `superfast`, `veryfast`, `faster`, `fast`, `medium`, `slow`, `slower`, `veryslow`, `placebo`. Slower = better quality at same bitrate, more CPU. | `fast` |
+| `--video-key-int` | `WHEP_SRT_VIDEO_KEY_INT` | x264enc max keyframe interval in frames. Smaller = faster initial sync for new viewers, worse compression efficiency. | `60` |
 | `--dot-debug` | | Output debug .dot files of the pipeline | `false` |
 
 ### Examples
