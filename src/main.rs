@@ -2,8 +2,8 @@ use clap::Parser;
 use env_logger::Env;
 use log::{self, error, info};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process::exit};
