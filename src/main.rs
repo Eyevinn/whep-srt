@@ -57,6 +57,27 @@ pub struct Args {
     pub video_key_int: u32,
 }
 
+/// Whether an RTP packet is evidence that its stream carries real media, rather than being a
+/// bandwidth-probing stream.
+///
+/// Some SFUs hand a WHEP consumer a padding-only stream alongside the real video, on the same
+/// payload type and the same `a-mid`, so the caps cannot tell them apart. Measured against
+/// Symphony Media Bridge, one such stream appears per session, and which pad number the real video
+/// arrives on varies between sessions — so a track cannot be chosen by pad name either.
+///
+/// Two signals, either sufficient. An unpadded packet (P bit clear) is ordinary media: measured
+/// over a full session the real video track set P on 0 of 4891 packets while the probing stream set
+/// it on 293 of 293. A marker bit is the other tell — it terminates a video frame, and the probing
+/// stream never sets one — which keeps this from misjudging a sender that pads its media for rate
+/// control.
+///
+/// Note the padding *length* cannot be used: the RFC 3550 pad count is a single byte, so a payload
+/// over 255 bytes is never "all padding" by that measure even when it carries no media, which is
+/// exactly the shape these packets have (measured 97..1169 bytes).
+fn rtp_carries_media(bytes: &[u8]) -> bool {
+    bytes.len() >= 12 && (bytes[0] & 0x20 == 0 || bytes[1] & 0x80 != 0)
+}
+
 fn main() {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
@@ -278,7 +299,18 @@ fn main() {
         let video_bridged = video_bridged.clone();
         let video_preset = video_preset_for_probe.clone();
 
-        pad.add_probe(PadProbeType::BUFFER, move |pad, _probe_info| {
+        let probe_logged = AtomicBool::new(false);
+        pad.add_probe(PadProbeType::BUFFER, move |pad, probe_info| {
+            // Does this packet prove the stream carries media? See rtp_carries_media.
+            let media_evidence = match probe_info.data {
+                Some(gst::PadProbeData::Buffer(ref buffer)) => buffer
+                    .map_readable()
+                    .ok()
+                    .map(|map| rtp_carries_media(map.as_slice()))
+                    .unwrap_or(false),
+                _ => false,
+            };
+
             let Some(caps) = pad.current_caps() else {
                 error!("buffer probe: could not get caps from pad '{}'", pad.name());
                 return gstreamer::PadProbeReturn::Remove;
@@ -292,7 +324,12 @@ fn main() {
                 return gstreamer::PadProbeReturn::Remove;
             };
 
-            info!("getting {media_type} track");
+            // Logged once per pad: the probe below re-runs for every buffer while a video track is
+            // still unproven, and the pad name matters because with more than one video pad it is
+            // otherwise impossible to tell from the logs which track was bridged.
+            if !probe_logged.swap(true, Ordering::AcqRel) {
+                info!("getting {media_type} track on pad '{}'", pad.name());
+            }
             match media_type.as_str() {
                 "audio" => {
                     let pipe_bin = pipeline_clone
@@ -363,11 +400,33 @@ fn main() {
                         .expect("could not link from webrtcbin audio pad to decodebin");
                 }
                 "video" => {
-                    // Bridge the first video track to mpegtsmux; send additional tracks to fakesink.
+                    // Until a track proves it carries media, drop its buffers and decide nothing.
+                    // Dropping is what makes waiting safe: the buffer never reaches the still
+                    // unlinked pad, so there is no GST_FLOW_NOT_LINKED and no bus error, and the
+                    // single bridge slot stays free for whichever track proves itself first.
+                    //
+                    // Without this, selection is first-buffer-wins between the real video and any
+                    // padding-only stream the SFU also sends (see rtp_carries_media). Bridging the
+                    // padding stream produces an SRT output with no video track at all — decodebin
+                    // never negotiates caps for it — and no error anywhere to explain why.
+                    if bridge_video && !media_evidence {
+                        return gstreamer::PadProbeReturn::Drop;
+                    }
+
+                    // First video track that proved itself wins; later ones go to fakesink.
                     // video_bridged.swap returns the *previous* value, so the first caller gets false
                     // and proceeds to bridge; all subsequent callers get true and use fakesink.
                     // AcqRel is sufficient: we only need to synchronise this flag, not other memory.
                     if !bridge_video || video_bridged.swap(true, Ordering::AcqRel) {
+                        info!(
+                            "discarding video pad '{}' to fakesink ({})",
+                            pad.name(),
+                            if bridge_video {
+                                "another video track was already bridged"
+                            } else {
+                                "video bridging disabled"
+                            }
+                        );
                         let pipe_bin = pipeline_clone
                             .dynamic_cast_ref::<gst::Bin>()
                             .expect("could not cast pipeline to bin");
@@ -577,4 +636,62 @@ fn debug_pipeline(pipe: &gst::Bin, str: &str) {
         .arg(format!("{filename}.svg"))
         .spawn();
     */
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal RTP packet: 12-byte header plus payload, with optional padding and marker
+    /// bits, so the tests exercise the same bytes an SFU would put on the wire.
+    fn rtp(padding: bool, marker: bool, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 12];
+        p[0] = 0x80 | if padding { 0x20 } else { 0 };
+        p[1] = 97 | if marker { 0x80 } else { 0 };
+        p.extend_from_slice(payload);
+        p
+    }
+
+    #[test]
+    fn unpadded_packets_are_media() {
+        assert!(rtp_carries_media(&rtp(
+            false,
+            false,
+            &[0x78, 0x00, 0x12, 0x67]
+        )));
+    }
+
+    #[test]
+    fn padded_packets_with_a_marker_are_still_media() {
+        // A sender may pad its media for rate control; the marker ends a frame, so this is video.
+        assert!(rtp_carries_media(&rtp(true, true, &[0x7c, 0x81, 0xe0])));
+    }
+
+    #[test]
+    fn padded_packets_without_a_marker_are_not_media() {
+        // The shape of a bandwidth-probing packet: padding bit set, no marker, payload of zeros.
+        assert!(!rtp_carries_media(&rtp(
+            true,
+            false,
+            &[0x59, 0xf9, 0, 0, 0, 0]
+        )));
+    }
+
+    #[test]
+    fn a_large_padded_payload_is_still_not_media() {
+        // Guards against judging by RFC 3550 pad length: over 255 bytes the single-byte pad count
+        // cannot describe the whole payload, so a length-based test would wrongly call this media.
+        let payload = {
+            let mut v = vec![0x59, 0xf9];
+            v.extend(std::iter::repeat_n(0u8, 1100));
+            v
+        };
+        assert!(!rtp_carries_media(&rtp(true, false, &payload)));
+    }
+
+    #[test]
+    fn truncated_buffers_are_not_media() {
+        assert!(!rtp_carries_media(&[0x80, 0x61, 0x00]));
+        assert!(!rtp_carries_media(&[]));
+    }
 }

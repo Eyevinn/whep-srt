@@ -150,9 +150,10 @@ The application dynamically constructs a GStreamer pipeline that:
    - Adds a silent audio test source to ensure continuous output
    - Encodes to AAC using `avenc_aac`
 4. **Video Processing Chain** (when `--bridge-video` is set):
-   - Decodes the first incoming video track using `decodebin` (supports VP8, VP9, H.264, H.265, AV1)
+   - Selects the first incoming video track that proves it carries media (see **Video Track Selection** below)
+   - Decodes it using `decodebin` (supports VP8, VP9, H.264, H.265, AV1)
    - Re-encodes to H.264 using `x264enc` with `tune=zerolatency` and `speed-preset=ultrafast`
-   - Additional video tracks (e.g. simulcast layers) are discarded to `fakesink`
+   - Further video tracks (e.g. simulcast layers) are discarded to `fakesink`
 5. **Output Chain**:
    - Muxes audio (and optionally video) into MPEG-TS using `mpegtsmux`
    - Sends to SRT destination via `srtsink`
@@ -203,6 +204,24 @@ Toggle between them by changing the `whepsrc` boolean variable in the code. Note
 - H.264 (Constrained Baseline, `tune=zerolatency`, `speed-preset=ultrafast`)
 
 > **Note:** Video is always re-encoded to H.264 regardless of input codec. H.264 passthrough (skipping decode+encode) is not yet supported.
+
+### Video Track Selection
+
+A WHEP source may offer more than one video track on the same `a=mid` and payload type. Besides
+simulcast layers, some SFUs also send a **padding-only stream** used for bandwidth probing — it
+carries no media at all, and nothing in the SDP or the caps distinguishes it from the real video.
+Pad names are no help either: which pad number the real video arrives on can differ between
+sessions.
+
+A video track is therefore only bridged once a packet proves it carries media: either an unpadded
+packet (RTP P bit clear) or one with a marker bit, which terminates a video frame. Until a track
+proves itself its buffers are dropped, leaving the single bridge slot free for whichever track
+proves itself first; tracks that never carry media are never bridged.
+
+Without this, selection is first-buffer-wins, and bridging a padding-only stream yields an SRT
+output with no video track at all — `decodebin` never negotiates caps for it — with nothing in the
+logs to explain why. The pad name of the bridged and discarded tracks is logged so this is
+diagnosable.
 
 ## Development
 
