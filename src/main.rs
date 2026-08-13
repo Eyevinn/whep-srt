@@ -1,6 +1,10 @@
 use clap::Parser;
 use env_logger::Env;
 use log::{self, error, info};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process::exit};
 
@@ -21,7 +25,7 @@ pub struct Args {
     pub output_url: String,
 
     /// Output debug .dot files
-    #[clap(long, default_value_t = false)]
+    #[clap(long)]
     pub dot_debug: bool,
 
     /// Jitterbuffer latency in milliseconds (sets rtpbin latency and liveadder min-upstream-latency)
@@ -31,6 +35,26 @@ pub struct Args {
     /// Authorization token for WHEP endpoint
     #[clap(long, env = "WHEP_SRT_AUTH_TOKEN")]
     pub auth_token: Option<String>,
+
+    /// Bridge video tracks from WHEP to SRT output (re-encodes to H.264 in MPEG-TS)
+    #[clap(long)]
+    pub bridge_video: bool,
+
+    /// x264enc bitrate in kbps (used when --bridge-video is set)
+    #[clap(long, env = "WHEP_SRT_VIDEO_BITRATE", default_value_t = 8000)]
+    pub video_bitrate: u32,
+
+    /// x264enc speed-preset: ultrafast, superfast, veryfast, faster, fast, medium, slow,
+    /// slower, veryslow, placebo.  Slower presets give better quality at the same bitrate
+    /// but use more CPU; veryfast/faster are usually safe for live, fast and above need
+    /// strong hardware for 720p+/30fps.
+    #[clap(long, env = "WHEP_SRT_VIDEO_PRESET", default_value_t = String::from("fast"))]
+    pub video_preset: String,
+
+    /// x264enc key-int-max: max distance between keyframes (in frames).  Smaller values
+    /// give faster initial sync for new viewers but worse compression efficiency.
+    #[clap(long, env = "WHEP_SRT_VIDEO_KEY_INT", default_value_t = 60)]
+    pub video_key_int: u32,
 }
 
 fn main() {
@@ -41,6 +65,10 @@ fn main() {
     let output_url = args.output_url;
     let dot_debug = args.dot_debug;
     let latency = args.latency;
+    let bridge_video = args.bridge_video;
+    let video_bitrate = args.video_bitrate;
+    let video_preset = args.video_preset;
+    let video_key_int = args.video_key_int;
 
     if dot_debug {
         let current_dir = format!(
@@ -59,6 +87,12 @@ fn main() {
     gst::init().expect("Could not initiate GStreamer");
 
     info!("SRT output at {output_url}");
+    if bridge_video {
+        info!(
+            "video bridging enabled: x264 preset={video_preset}, bitrate={video_bitrate} kbps, \
+             key-int-max={video_key_int}, tune=zerolatency"
+        );
+    }
     info!("---");
 
     /*  NOTE:
@@ -89,6 +123,14 @@ fn main() {
 
     let mixer = "liveadder name=mixer"; //this could be audiomixer also, but liveadder will do fine here
 
+    // Note on the initial PMT: with --bridge-video, the real-video chain attaches to
+    // mpegtsmux dynamically when WHEP delivers a video pad (some seconds after startup).
+    // Until then the streamheader PAT/PMT advertises audio only.  SRT relays that latch
+    // onto the initial streamheaders therefore expose audio only to subscribers.  We
+    // previously tried a videotestsrc-fed input-selector to inject video into the initial
+    // PMT, but mpegtsmux's aggregator stalls on the running-time discontinuity that comes
+    // with the active-pad switch — better to keep the pipeline simple and document the
+    // limitation than to ship a stream that hangs.
     let pipeline_str = format!(
         "{input} audiotestsrc wave=silence is-live=true ! audio/x-raw,format=F32LE,rate=48000,channels=2 ! {mixer} ! avenc_aac ! aacparse ! mux. \
         mpegtsmux name=mux alignment=7 ! queue ! srtsink uri=\"{output_url}\" sync=false wait-for-connection=false latency=100"
@@ -122,6 +164,9 @@ fn main() {
         .expect("could not find mixer element");
     mixer.set_property_from_str("min-upstream-latency", &format!("{latency}000000"));
     let mixer_clone = mixer.clone();
+
+    // Guard: only the first arriving video pad is bridged; additional video tracks go to fakesink.
+    let video_bridged = Arc::new(AtomicBool::new(false));
 
     let input_whep_bin = pipeline
         .by_name("input")
@@ -219,6 +264,7 @@ fn main() {
         }
     });
 
+    let video_preset_for_probe = video_preset.clone();
     input_whep_bin.connect_pad_added(move |elem, pad| {
         info!(
             "pad added on {} named '{}': '{}'",
@@ -229,10 +275,22 @@ fn main() {
 
         let pipeline_clone = pipeline_clone.clone();
         let mixer_clone = mixer_clone.clone();
+        let video_bridged = video_bridged.clone();
+        let video_preset = video_preset_for_probe.clone();
 
         pad.add_probe(PadProbeType::BUFFER, move |pad, _probe_info| {
-            let caps = pad.current_caps().unwrap();
-            let media_type = caps.structure(0).unwrap().get::<String>("media").unwrap();
+            let Some(caps) = pad.current_caps() else {
+                error!("buffer probe: could not get caps from pad '{}'", pad.name());
+                return gstreamer::PadProbeReturn::Remove;
+            };
+            let Some(structure) = caps.structure(0) else {
+                error!("buffer probe: caps on pad '{}' have no structure", pad.name());
+                return gstreamer::PadProbeReturn::Remove;
+            };
+            let Ok(media_type) = structure.get::<String>("media") else {
+                error!("buffer probe: caps on pad '{}' have no media field", pad.name());
+                return gstreamer::PadProbeReturn::Remove;
+            };
 
             info!("getting {media_type} track");
             match media_type.as_str() {
@@ -296,30 +354,140 @@ fn main() {
                             .expect("could not link decodebin to audioconvert sink");
                     });
 
-                    //link from webrtcbin to decodebin
-                    let decodebin_pad = decodebin.iterate_sink_pads().next().unwrap().unwrap();
-
+                    let decodebin_pad = decodebin
+                        .sink_pads()
+                        .into_iter()
+                        .next()
+                        .expect("audio decodebin has no sink pad");
                     pad.link(&decodebin_pad)
                         .expect("could not link from webrtcbin audio pad to decodebin");
                 }
                 "video" => {
-                    //TODO: this should be sent to muxer maybe?
+                    // Bridge the first video track to mpegtsmux; send additional tracks to fakesink.
+                    // video_bridged.swap returns the *previous* value, so the first caller gets false
+                    // and proceeds to bridge; all subsequent callers get true and use fakesink.
+                    // AcqRel is sufficient: we only need to synchronise this flag, not other memory.
+                    if !bridge_video || video_bridged.swap(true, Ordering::AcqRel) {
+                        let pipe_bin = pipeline_clone
+                            .dynamic_cast_ref::<gst::Bin>()
+                            .expect("could not cast pipeline to bin");
+                        let fakesink = ElementFactory::make("fakesink")
+                            .build()
+                            .expect("could not create video fakesink");
+                        pipe_bin
+                            .add(&fakesink)
+                            .expect("could not add video fakesink to pipeline");
+                        fakesink
+                            .sync_state_with_parent()
+                            .expect("could not sync state on fakesink");
+                        pad.link(&fakesink.static_pad("sink").unwrap())
+                            .expect("could not link video pad to fakesink");
+                    } else {
+                        let encoding_name = structure
+                            .get::<String>("encoding-name")
+                            .unwrap_or_default();
+                        info!("bridging {encoding_name} video track to SRT output (transcode to H.264)");
 
-                    let fakesink = ElementFactory::make("fakesink")
-                        .build()
-                        .expect("could not create video fakesink");
+                        let pipe_bin = pipeline_clone
+                            .dynamic_cast_ref::<gst::Bin>()
+                            .expect("could not cast pipeline to bin");
 
-                    pipeline_clone
-                        .add(&fakesink)
-                        .expect("could not add video fakesink to pipeline");
-                    fakesink
-                        .sync_state_with_parent()
-                        .expect("could not sync state on fakesink");
-                    let fakesink_pad = fakesink
-                        .static_pad("sink")
-                        .expect("could not get fakesink pad");
-                    pad.link(&fakesink_pad)
-                        .expect("could not link video sinkpad sink");
+                        let decodebin = ElementFactory::make("decodebin")
+                            .build()
+                            .expect("could not create video decodebin");
+                        pipe_bin
+                            .add(&decodebin)
+                            .expect("could not add video decodebin to pipeline");
+                        decodebin
+                            .sync_state_with_parent()
+                            .expect("could not sync video decodebin state");
+
+                        // Clone references for the decodebin pad-added closure.
+                        // pipe_bin borrow must end before pipeline_clone.clone() — NLL handles this.
+                        let pipe_bin_clone = pipe_bin.clone();
+                        let pipeline_for_mux = pipeline_clone.clone();
+                        let video_preset = video_preset.clone();
+
+                        decodebin.connect_pad_added(move |_elem, src_pad| {
+                            info!("video decodebin src pad added: '{}'", src_pad.name());
+
+                            // Decode → convert → encode H.264 → byte-stream caps → queue → mux.
+                            // tune=zerolatency: no B-frames / no lookahead — required for live.
+                            // bframes=0 and CABAC are already correct via tune=zerolatency.
+                            // speed-preset / bitrate / key-int-max are tunable via CLI flags;
+                            // see Args for env var names and defaults.
+                            let videoconvert = ElementFactory::make("videoconvert")
+                                .build()
+                                .expect("could not create videoconvert");
+                            let x264enc = ElementFactory::make("x264enc")
+                                .build()
+                                .expect("could not create x264enc — ensure gstreamer1.0-plugins-ugly is installed");
+                            x264enc.set_property_from_str("tune", "zerolatency");
+                            x264enc.set_property_from_str("speed-preset", &video_preset);
+                            x264enc.set_property_from_str("bitrate", &video_bitrate.to_string());
+                            x264enc.set_property_from_str("key-int-max", &video_key_int.to_string());
+                            let h264parse = ElementFactory::make("h264parse")
+                                .build()
+                                .expect("could not create h264parse");
+                            h264parse.set_property_from_str("config-interval", "-1");
+                            let stream_caps = ElementFactory::make("capsfilter")
+                                .build()
+                                .expect("could not create h264 stream capsfilter");
+                            stream_caps.set_property_from_str(
+                                "caps",
+                                "video/x-h264,stream-format=byte-stream,alignment=au",
+                            );
+                            let queue = ElementFactory::make("queue")
+                                .build()
+                                .expect("could not create video queue");
+
+                            let elements = [&videoconvert, &x264enc, &h264parse, &stream_caps, &queue];
+                            pipe_bin_clone
+                                .add_many(elements)
+                                .expect("could not add video encode elements to pipeline");
+                            for elem in elements {
+                                elem.sync_state_with_parent()
+                                    .expect("could not sync video encode element state");
+                            }
+                            gst::Element::link_many(elements)
+                                .expect("could not link video encode chain");
+
+                            let mux = pipeline_for_mux
+                                .by_name("mux")
+                                .expect("could not find mpegtsmux");
+                            let h264_caps = gst::Caps::builder("video/x-h264").build();
+                            let mux_video_pad = mux
+                                .pad_template_list()
+                                .into_iter()
+                                .find(|t| {
+                                    t.direction() == gst::PadDirection::Sink
+                                        && t.presence() == gst::PadPresence::Request
+                                        && t.caps().can_intersect(&h264_caps)
+                                })
+                                .inspect(|t| {
+                                    info!("requesting mpegtsmux video pad via template '{}'", t.name_template());
+                                })
+                                .and_then(|t| mux.request_pad(&t, None, None))
+                                .expect("could not request a video pad from mpegtsmux");
+                            queue
+                                .static_pad("src")
+                                .unwrap()
+                                .link(&mux_video_pad)
+                                .expect("could not link video queue src to mpegtsmux");
+
+                            src_pad
+                                .link(&videoconvert.static_pad("sink").unwrap())
+                                .expect("could not link video decodebin src to videoconvert");
+                        });
+
+                        let decodebin_sink = decodebin
+                            .sink_pads()
+                            .into_iter()
+                            .next()
+                            .expect("video decodebin has no sink pad");
+                        pad.link(&decodebin_sink)
+                            .expect("could not link video whep pad to video decodebin");
+                    }
                 }
                 _ => {
                     error!("unhandled media type");

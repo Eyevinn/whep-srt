@@ -16,6 +16,7 @@ This tool consumes WebRTC media from a WHEP endpoint and re-streams it as SRT, e
 - **WHEP Input**: Consumes WebRTC streams via the WHEP protocol
 - **SRT Output**: Outputs to SRT with configurable parameters
 - **Audio Processing**: Automatically handles audio decoding, conversion, and AAC encoding
+- **Video Bridging**: Optional VP8/VP9/H.264/H.265/AV1 → H.264 transcoding into the SRT output (enable with `--bridge-video`)
 - **Multi-track Support**: Handles multiple audio tracks via audio mixing (liveadder)
 - **Continuous Output**: Silent audio source ensures continuous stream even without input
 - **Docker Support**: Ready-to-use Docker image with all dependencies included
@@ -87,6 +88,10 @@ docker run -it whep-srt -i <WHEP_ENDPOINT_URL> -o <SRT_OUTPUT_URL>
 | `-o, --output-url` | | SRT output stream URL | `srt://0.0.0.0:1234?mode=listener` |
 | `--auth-token` | `WHEP_SRT_AUTH_TOKEN` | Authorization token for WHEP endpoint | - |
 | `--latency` | `WHEP_SRT_JITTERBUFFER_LATENCY` | Jitterbuffer latency in ms (sets rtpbin latency and liveadder min-upstream-latency) | `200` |
+| `--bridge-video` | | Transcode incoming video tracks to H.264 and include them in the SRT output | `false` |
+| `--video-bitrate` | `WHEP_SRT_VIDEO_BITRATE` | x264enc target bitrate in kbps (only used with `--bridge-video`) | `8000` |
+| `--video-preset` | `WHEP_SRT_VIDEO_PRESET` | x264enc speed-preset: `ultrafast`, `superfast`, `veryfast`, `faster`, `fast`, `medium`, `slow`, `slower`, `veryslow`, `placebo`. Slower = better quality at same bitrate, more CPU. | `fast` |
+| `--video-key-int` | `WHEP_SRT_VIDEO_KEY_INT` | x264enc max keyframe interval in frames. Smaller = faster initial sync for new viewers, worse compression efficiency. | `60` |
 | `--dot-debug` | | Output debug .dot files of the pipeline | `false` |
 
 ### Examples
@@ -94,6 +99,11 @@ docker run -it whep-srt -i <WHEP_ENDPOINT_URL> -o <SRT_OUTPUT_URL>
 **Listen for SRT connections on port 1234 (default):**
 ```bash
 ./whep-srt -i http://localhost:8889/mystream/whep
+```
+
+**Bridge video (transcode to H.264):**
+```bash
+./whep-srt -i http://localhost:8889/mystream/whep --bridge-video
 ```
 
 **Push to a specific SRT destination:**
@@ -107,6 +117,18 @@ docker run -it whep-srt -i <WHEP_ENDPOINT_URL> -o <SRT_OUTPUT_URL>
 docker run -p 1234:1234/udp whep-srt \
   -i http://host.docker.internal:8889/mystream/whep \
   -o "srt://0.0.0.0:1234?mode=listener"
+```
+
+**Using Docker with video bridging:**
+```bash
+docker run -p 1234:1234/udp whep-srt \
+  -i http://host.docker.internal:8889/mystream/whep \
+  --bridge-video
+```
+
+**Playing the SRT output with ffplay (low-latency):**
+```bash
+ffplay -fflags nobuffer -flags low_delay -framedrop -f mpegts srt://127.0.0.1:1234
 ```
 
 **Running the included debug script:**
@@ -127,8 +149,12 @@ The application dynamically constructs a GStreamer pipeline that:
    - Mixes multiple audio tracks using `liveadder`
    - Adds a silent audio test source to ensure continuous output
    - Encodes to AAC using `avenc_aac`
-4. **Output Chain**:
-   - Muxes audio into MPEG-TS using `mpegtsmux`
+4. **Video Processing Chain** (when `--bridge-video` is set):
+   - Decodes the first incoming video track using `decodebin` (supports VP8, VP9, H.264, H.265, AV1)
+   - Re-encodes to H.264 using `x264enc` with `tune=zerolatency` and `speed-preset=ultrafast`
+   - Additional video tracks (e.g. simulcast layers) are discarded to `fakesink`
+5. **Output Chain**:
+   - Muxes audio (and optionally video) into MPEG-TS using `mpegtsmux`
    - Sends to SRT destination via `srtsink`
 
 **Pipeline String (when using whepsrc):**
@@ -170,12 +196,13 @@ Toggle between them by changing the `whepsrc` boolean variable in the code. Note
 **Audio Input (via RTP):**
 - OPUS (default, 48kHz)
 
-**Video Input (via RTP):**
-- VP8, VP9 (default)
-- H.264, H.265
-- AV1
+**Video Input (via RTP, when `--bridge-video` is set):**
+- VP8, VP9, H.264, H.265, AV1 (decoded by `decodebin`, re-encoded to H.264)
 
-*Note: Video tracks are currently sent to `fakesink` and not included in SRT output.*
+**Video Output:**
+- H.264 (Constrained Baseline, `tune=zerolatency`, `speed-preset=ultrafast`)
+
+> **Note:** Video is always re-encoded to H.264 regardless of input codec. H.264 passthrough (skipping decode+encode) is not yet supported.
 
 ## Development
 
@@ -223,8 +250,8 @@ xdot 1729000000-error.dot
 
 ## Known Issues & Limitations
 
-- **Video handling**: Video tracks are currently discarded (sent to `fakesink`)
-- **Audio-only output**: Only audio is currently muxed to SRT output
+- **Video re-encode only**: Video is always transcoded to H.264. H.264 passthrough (skipping decode+encode when the source is already H.264) is not yet implemented.
+- **Single video track**: Only the first video track is bridged; additional tracks are discarded.
 
 ## Troubleshooting
 
@@ -244,7 +271,7 @@ Enable debug logging to see if audio pads are being created and linked correctly
 
 ## Future Improvements
 
-- [ ] Add video support to SRT output
+- [ ] H.264 passthrough when the incoming WebRTC stream is already H.264 (skip decode+encode)
 
 ## License
 
