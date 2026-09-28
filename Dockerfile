@@ -61,6 +61,24 @@ RUN apt-get update && apt-get install -y \
     gstreamer1.0-nice \
     && rm -rf /var/lib/apt/lists/*
 
+# Assert that the transitively-installed libsrt meets the patched revision for
+# CVE-2026-55869 / CVE-2026-55868. libsrt is pulled in via
+# gstreamer1.0-plugins-bad; we check a MINIMUM version (not an exact pin, which
+# would break on every future security bump) and fail the build loudly if the
+# base image ever resolves an older, unpatched libsrt.
+RUN set -eux; \
+    installed="$(dpkg-query -W -f='${Package}\t${Version}\n' 'libsrt*' 2>/dev/null | awk 'NR==1{print $2}')"; \
+    if [ -z "$installed" ]; then \
+      echo "ERROR: libsrt not present in runtime image; expected it via gstreamer1.0-plugins-bad" >&2; \
+      exit 1; \
+    fi; \
+    required="1.5.4-1+deb13u1"; \
+    if ! dpkg --compare-versions "$installed" ge "$required"; then \
+      echo "ERROR: installed libsrt $installed is older than required $required (CVE-2026-55869/CVE-2026-55868)" >&2; \
+      exit 1; \
+    fi; \
+    echo "libsrt $installed satisfies >= $required"
+
 WORKDIR /app
 COPY --from=builder /app/target/release/whep-srt ./whep-srt
 
